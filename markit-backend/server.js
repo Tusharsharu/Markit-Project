@@ -10,7 +10,7 @@ const rateLimit = require('express-rate-limit');
 const path = require('path');
 
 const { errorHandler, notFound } = require('./middleware/errorHandler');
-const { startPriceSimulator } = require('./services/priceSimulator');
+const { startLiveUpdater } = require('./services/liveUpdater');
 
 // Routes
 const authRoutes = require('./routes/auth');
@@ -203,7 +203,7 @@ async function startServer() {
     }
 
     // Start price simulation
-    startPriceSimulator();
+    startLiveUpdater();
 
     app.listen(PORT, () => {
       console.log('\n╔═══════════════════════════════════════╗');
