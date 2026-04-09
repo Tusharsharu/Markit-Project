@@ -44,11 +44,14 @@ markit-project/
 
 Built with ❤️ using Node.js + Express + SQLite
 
-License
+License:
+
 This project is licensed under the MIT License. See the LICENSE file for details.
 
-Contact
+Contact:
+
 If you have any questions or suggestions, feel free to reach out to the project maintainers:
 
 Tushar Sharu - tusharsharu2809@gmail.com
+
 GitHub: tusharsharu
