@@ -1,9 +1,10 @@
 const { getLiveQuote } = require('./angelone');
 const { getDb } = require('../db/database');
-const { STOCK_TOKENS } = require('../db/stockTokens');
+const { getToken } = require('../db/stockTokens'); // ✅ FIX
 
 let updateInterval = null;
 
+// 🕒 Market check
 function checkMarketOpen() {
   const now = new Date();
   const IST_OFFSET = 330;
@@ -17,6 +18,7 @@ function checkMarketOpen() {
   return istDay >= 1 && istDay <= 5 && istMinutes >= marketStart && istMinutes <= marketEnd;
 }
 
+// 🔥 MAIN UPDATE FUNCTION
 async function updateAllStockPrices() {
   if (!checkMarketOpen()) {
     console.log('[LiveUpdater] Market closed — skipping update');
@@ -28,11 +30,17 @@ async function updateAllStockPrices() {
   const stocks = db.prepare('SELECT symbol FROM stocks').all();
 
   for (const stock of stocks) {
-    const tokenInfo = STOCK_TOKENS[stock.symbol];
-    if (!tokenInfo) continue;
+    const token = getToken(stock.symbol); // ✅ FIX
+
+    if (!token) {
+      console.log("❌ Token not found:", stock.symbol);
+      continue;
+    }
 
     try {
-      const quote = await getLiveQuote(tokenInfo.exchange, tokenInfo.tradingSymbol, tokenInfo.token);
+      // ✅ FIX: sirf stock name pass karna hai
+      const quote = await getLiveQuote(stock.symbol);
+
       if (!quote) continue;
 
       db.prepare(`
@@ -57,23 +65,32 @@ async function updateAllStockPrices() {
 
       console.log(`[LiveUpdater] ✅ ${stock.symbol}: ₹${quote.ltp}`);
 
-      // 1 second delay to avoid rate limit
+      // ⏳ rate limit avoid
       await new Promise(r => setTimeout(r, 1000));
+
     } catch (err) {
       console.error(`[LiveUpdater] ❌ ${stock.symbol}:`, err.message);
     }
   }
+
   console.log('[LiveUpdater] ✅ All prices updated');
 }
 
+// 🚀 Start
 function startLiveUpdater() {
   console.log('[LiveUpdater] 🚀 Started — checking every 15 seconds');
   updateAllStockPrices();
   updateInterval = setInterval(updateAllStockPrices, 15000);
 }
 
+// 🛑 Stop
 function stopLiveUpdater() {
   if (updateInterval) clearInterval(updateInterval);
 }
 
-module.exports = { startLiveUpdater, stopLiveUpdater, checkMarketOpen, updateAllStockPrices };
+module.exports = {
+  startLiveUpdater,
+  stopLiveUpdater,
+  checkMarketOpen,
+  updateAllStockPrices
+};

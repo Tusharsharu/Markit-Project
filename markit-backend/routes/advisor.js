@@ -1,171 +1,201 @@
-// routes/advisor.js — AI Portfolio Advisor
+// routes/advisor.js — AI Portfolio Advisor using Claude API
 const express = require('express');
 const router = express.Router();
-const { body, validationResult } = require('express-validator');
 const { getDb } = require('../db/database');
-const { optionalAuth } = require('../middleware/auth');
 const { asyncHandler } = require('../middleware/errorHandler');
 
 // =====================
 // POST /api/advisor/recommend
-// Body: { amount, horizon, sector, risk }
-// Returns: portfolio allocation recommendations
 // =====================
-router.post('/recommend', optionalAuth, [
-  body('amount').isFloat({ min: 1000 }).withMessage('Minimum investment ₹1,000'),
-  body('horizon').isIn(['short', 'medium', 'long']),
-  body('risk').isIn(['low', 'moderate', 'high']),
-  body('sector').optional(),
-], asyncHandler(async (req, res) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    return res.status(400).json({ success: false, message: 'Validation failed', errors: errors.array() });
-  }
-
-  const { amount, horizon, sector = 'all', risk } = req.body;
+router.post('/recommend', asyncHandler(async (req, res) => {
+  const { amount = 100000, horizon = 'medium', sector = 'all', risk = 'moderate' } = req.body;
   const db = getDb();
 
-  // Fetch stocks with predictions
-  let query = `
-    SELECT s.*, 
-      p1d.target_price as p1d_price, p1d.pct_change as p1d_pct, p1d.signal as p1d_signal,
-      p1w.target_price as p1w_price, p1w.pct_change as p1w_pct, p1w.signal as p1w_signal,
-      p1m.target_price as p1m_price, p1m.pct_change as p1m_pct, p1m.signal as p1m_signal, p1m.confidence as p1m_conf
-    FROM stocks s
-    LEFT JOIN predictions p1d ON s.symbol = p1d.symbol AND p1d.timeframe = '1d'
-    LEFT JOIN predictions p1w ON s.symbol = p1w.symbol AND p1w.timeframe = '1w'
-    LEFT JOIN predictions p1m ON s.symbol = p1m.symbol AND p1m.timeframe = '1m'
-  `;
-
+  // Get real stock data from DB
+  let query = 'SELECT * FROM stocks';
   const params = [];
   if (sector && sector !== 'all') {
-    query += ' WHERE s.sector = ?';
+    query += ' WHERE sector = ?';
     params.push(sector);
   }
+  query += ' ORDER BY volume DESC LIMIT 30';
 
   const stocks = db.prepare(query).all(...params);
 
-  // === SCORING ALGORITHM ===
+  const stocksWithChange = stocks.map(s => ({
+    symbol: s.symbol,
+    name: s.name,
+    sector: s.sector,
+    exchange: s.exchange,
+    price: parseFloat(s.price),
+    prevClose: parseFloat(s.prev_close),
+    open: parseFloat(s.open),
+    high: parseFloat(s.day_high),
+    low: parseFloat(s.day_low),
+    volume: s.volume,
+    peRatio: s.pe_ratio,
+    beta: s.beta,
+    changePct: parseFloat(((s.price - s.prev_close) / s.prev_close * 100).toFixed(2)),
+  }));
+
+  // Use Claude API for AI recommendations
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+
+  if (anthropicApiKey) {
+    try {
+      const claudeResult = await getClaudeRecommendations(stocksWithChange, amount, horizon, risk, anthropicApiKey);
+      return res.json({ success: true, data: claudeResult });
+    } catch (err) {
+      console.error('[Advisor] Claude API error:', err.message);
+      // Fall through to rule-based
+    }
+  }
+
+  // Fallback: rule-based recommendations
+  const result = getRuleBasedRecommendations(stocksWithChange, amount, horizon, risk);
+  res.json({ success: true, data: result });
+}));
+
+// =====================
+// CLAUDE AI RECOMMENDATIONS
+// =====================
+async function getClaudeRecommendations(stocks, amount, horizon, risk, apiKey) {
+  const stockSummary = stocks.slice(0, 15).map(s =>
+    `${s.symbol} (${s.sector}): Price ₹${s.price}, Change ${s.changePct}%, PE: ${s.peRatio || 'N/A'}, Beta: ${s.beta || 'N/A'}`
+  ).join('\n');
+
+  const prompt = `You are an expert Indian stock market analyst. Analyze these NSE/BSE stocks and recommend a portfolio.
+
+INVESTOR PROFILE:
+- Investment Amount: ₹${amount.toLocaleString('en-IN')}
+- Horizon: ${horizon === 'short' ? '1-3 months' : horizon === 'medium' ? '3-12 months' : '1+ year'}
+- Risk Appetite: ${risk}
+
+CURRENT MARKET DATA:
+${stockSummary}
+
+Create a diversified portfolio recommendation. Respond ONLY with valid JSON, no markdown, no explanation outside JSON:
+{
+  "summary": {
+    "strategy": "brief strategy name",
+    "totalInvestment": ${amount},
+    "horizon": "${horizon === 'short' ? '1-3 months' : horizon === 'medium' ? '3-12 months' : '1+ year'}",
+    "estimatedReturnPct": <number>,
+    "estimatedProfit": <number>
+  },
+  "recommendations": [
+    {
+      "symbol": "SYMBOL",
+      "sector": "sector name",
+      "allocationPct": <number 5-40>,
+      "allocationAmount": <amount in rupees>,
+      "signal": "buy|hold|sell",
+      "confidence": <number 50-95>,
+      "estimatedReturnPct": <number>,
+      "reasoning": "2-line reasoning based on price, sector, risk"
+    }
+  ],
+  "disclaimer": "Investments are subject to market risk. This is AI-generated analysis, not SEBI-registered advice."
+}
+
+Rules:
+- Pick 3-6 stocks based on risk (low=3 stocks, moderate=4-5, high=5-6)
+- allocations must sum to 100%
+- For low risk: stable large-caps, low beta; For high risk: growth stocks, higher beta
+- Base reasoning on actual price data provided`;
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: 'claude-opus-4-5',
+      max_tokens: 1500,
+      messages: [{ role: 'user', content: prompt }]
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Claude API error: ${response.status}`);
+  }
+
+  const data = await response.json();
+  const text = data.content[0].text.trim();
+
+  // Parse JSON (strip any markdown fences if present)
+  const clean = text.replace(/```json|```/g, '').trim();
+  return JSON.parse(clean);
+}
+
+// =====================
+// RULE-BASED FALLBACK
+// =====================
+function getRuleBasedRecommendations(stocks, amount, horizon, risk) {
+  // Score each stock
   const scored = stocks.map(s => {
-    let score = 0;
+    let score = 50;
 
-    // Base: prediction signal strength
-    if (s.p1m_signal === 'buy') score += 40;
-    else if (s.p1m_signal === 'hold') score += 15;
-    else score -= 10;
+    // Momentum (recent change)
+    if (s.changePct > 0) score += Math.min(s.changePct * 3, 15);
+    else score += Math.max(s.changePct * 2, -10);
 
-    // Prediction pct (normalized to ±30 max)
-    score += Math.min(Math.max(s.p1m_pct || 0, -15), 30);
-
-    // Confidence bonus
-    score += (s.p1m_conf || 50) * 0.2;
-
-    // Risk adjustments
-    const volatility = s.beta || 1;
+    // Risk-adjusted scoring
+    const beta = s.beta || 1;
     if (risk === 'low') {
-      // Prefer stable, low-beta, dividend stocks
-      score -= (volatility - 0.7) * 20;
-      if (s.dividend_yield > 1) score += s.dividend_yield * 5;
-      if (s.pe_ratio < 25) score += 5;
+      score += beta < 0.8 ? 15 : beta > 1.2 ? -15 : 0;
+      if (s.peRatio && s.peRatio < 20) score += 10;
     } else if (risk === 'high') {
-      // Prefer high-beta, high-momentum stocks
-      score += volatility * 10;
-      if (s.p1m_pct > 10) score += 15;
-    } else {
-      // Moderate: balanced
-      score -= Math.abs(volatility - 1) * 5;
-      if (s.pe_ratio < 40) score += 5;
+      score += beta > 1.2 ? 10 : beta < 0.8 ? -5 : 0;
     }
 
-    // Horizon adjustments
-    if (horizon === 'short') {
-      score = score * 0.5 + ((s.p1d_pct || 0) + (s.p1w_pct || 0)) * 5;
-    } else if (horizon === 'long') {
-      score += (s.dividend_yield || 0) * 8;
-      if (s.pe_ratio < 30) score += 8;
-    }
+    // Sector preference by horizon
+    if (horizon === 'long' && ['Banking', 'IT', 'FMCG'].includes(s.sector)) score += 8;
+    if (horizon === 'short' && s.changePct > 1) score += 12;
 
     return { ...s, score };
   });
 
-  // Filter only positive scored (buy-worthy) and sort
-  const filtered = scored
-    .filter(s => s.score > 0 && s.p1m_signal !== 'sell')
-    .sort((a, b) => b.score - a.score);
+  scored.sort((a, b) => b.score - a.score);
 
-  // Take top N based on risk (diversification)
-  const topN = risk === 'low' ? 3 : risk === 'high' ? 5 : 4;
-  const top = filtered.slice(0, Math.min(topN, filtered.length));
+  const numStocks = risk === 'low' ? 3 : risk === 'high' ? 6 : 4;
+  const selected = scored.slice(0, numStocks);
 
-  if (!top.length) {
-    return res.json({
-      success: true,
-      data: {
-        recommendations: [],
-        message: 'No strong buy signals found for your criteria. Try adjusting your filters.'
-      }
-    });
-  }
+  // Calculate allocations
+  const totalScore = selected.reduce((acc, s) => acc + s.score, 0);
+  let allocations = selected.map(s => ({
+    ...s,
+    allocationPct: Math.round((s.score / totalScore) * 100),
+  }));
 
-  // Calculate allocations (weighted by score)
-  const totalScore = top.reduce((a, s) => a + s.score, 0);
+  // Normalize to 100%
+  const sum = allocations.reduce((a, s) => a + s.allocationPct, 0);
+  if (sum !== 100) allocations[0].allocationPct += (100 - sum);
 
-  const recommendations = top.map(s => {
-    const allocPct = parseFloat(((s.score / totalScore) * 100).toFixed(1));
-    const allocRupees = Math.round((s.score / totalScore) * amount);
+  const estimatedReturnPct = risk === 'low' ? 8 : risk === 'high' ? 18 : 12;
 
-    const horizonPct = {
-      short: s.p1w_pct || s.p1d_pct,
-      medium: s.p1m_pct,
-      long: s.p1m_pct ? s.p1m_pct * 2.5 : null,
-    }[horizon];
-
-    const estReturn = horizonPct ? parseFloat(horizonPct.toFixed(2)) : null;
-    const estProfit = estReturn ? Math.round(allocRupees * estReturn / 100) : null;
-
-    return {
+  return {
+    summary: {
+      strategy: risk === 'low' ? 'Conservative Blue-Chip Portfolio' : risk === 'high' ? 'Aggressive Growth Portfolio' : 'Balanced Growth Portfolio',
+      totalInvestment: amount,
+      horizon: horizon === 'short' ? '1-3 months' : horizon === 'medium' ? '3-12 months' : '1+ year',
+      estimatedReturnPct,
+      estimatedProfit: Math.round(amount * estimatedReturnPct / 100),
+    },
+    recommendations: allocations.map(s => ({
       symbol: s.symbol,
-      name: s.name,
-      exchange: s.exchange,
       sector: s.sector,
-      currentPrice: s.price,
-      allocationPct: allocPct,
-      allocationAmount: allocRupees,
-      estimatedReturnPct: estReturn,
-      estimatedProfit: estProfit,
-      signal: s.p1m_signal,
-      confidence: s.p1m_conf,
-      targetPrice: s.p1m_price,
-      pe_ratio: s.pe_ratio,
-      beta: s.beta,
-      dividend_yield: s.dividend_yield,
-    };
-  });
-
-  // Summary stats
-  const totalEstimatedReturn = recommendations.reduce((acc, r) => {
-    return acc + (r.estimatedProfit || 0);
-  }, 0);
-
-  const horizonLabel = { short: '1-3 months', medium: '3-12 months', long: '1-3 years' }[horizon];
-  const riskLabel = { low: 'Conservative', moderate: 'Balanced', high: 'Aggressive' }[risk];
-
-  res.json({
-    success: true,
-    data: {
-      input: { amount, horizon, sector, risk },
-      summary: {
-        totalInvestment: amount,
-        stockCount: recommendations.length,
-        strategy: `${riskLabel} Portfolio`,
-        horizon: horizonLabel,
-        estimatedProfit: totalEstimatedReturn,
-        estimatedReturnPct: parseFloat(((totalEstimatedReturn / amount) * 100).toFixed(2)),
-      },
-      recommendations,
-      disclaimer: 'These recommendations are AI-generated based on technical analysis and are for educational purposes only. Not financial advice. Please consult a SEBI-registered advisor before investing.'
-    }
-  });
-}));
+      allocationPct: s.allocationPct,
+      allocationAmount: Math.round(amount * s.allocationPct / 100),
+      signal: s.changePct > 0.5 ? 'buy' : s.changePct < -0.5 ? 'sell' : 'hold',
+      confidence: Math.min(95, Math.round(s.score)),
+      estimatedReturnPct: parseFloat((estimatedReturnPct * (0.8 + Math.random() * 0.4)).toFixed(1)),
+      reasoning: `${s.sector} sector. Current price ₹${s.price} with ${s.changePct > 0 ? '+' : ''}${s.changePct}% today. ${risk === 'low' ? 'Stable fundamentals suitable for conservative investors.' : 'Growth potential aligned with risk profile.'}`
+    })),
+    disclaimer: 'Investments are subject to market risk. This is algorithm-based analysis, not SEBI-registered advice. Please consult a financial advisor.'
+  };
+}
 
 module.exports = router;

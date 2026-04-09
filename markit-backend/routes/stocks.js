@@ -207,3 +207,31 @@ function formatStock(s) {
 }
 
 module.exports = router;
+
+
+// 🔥 LIVE PRICE API
+const { getLiveQuote } = require('../services/angelone');
+
+router.get('/live/:name', async (req, res) => {
+  try {
+    const stockName = req.params.name;
+
+    const data = await getLiveQuote(stockName);
+
+    if (!data) {
+      return res.status(404).json({
+        success: false,
+        message: "Stock not found"
+      });
+    }
+
+    res.json({
+      success: true,
+      data
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
